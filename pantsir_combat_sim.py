@@ -370,8 +370,16 @@ class SimTarget:
     def trigger_defensive_maneuver(self, force_notch=False):
         if self.is_munitions or not self.alive:
             return
-        spd = max(80.0, self.speed())
+        spd = max(45.0 if self.kind == "uav" else 80.0, self.speed())
         _, az_deg, _ = self.polar()
+        if self.kind == "uav":
+            # У БПЛА нет СПО: они уклоняются слабо и вяло, без резкого ухода в траверз и без постановки РЭБ-помех
+            self.evasion_timer = random.uniform(0.8, 1.6)
+            self.evasion_turn_rate = random.choice([-1.0, 1.0]) * random.uniform(4.5, 9.0)
+            self.evasion_alt_rate = random.choice([-1.0, 1.0]) * random.uniform(0.02, 0.05)
+            self.jamming_timer = 0.0
+            self.jamming_boost = 0.0
+            return
         if force_notch:
             perp_deg = (az_deg + random.choice([-90.0, 90.0])) % 360.0
             rad = math.radians(perp_deg)
@@ -582,15 +590,22 @@ class ActiveSamProjectile:
 
 
 class GunTracerBurst:
-    def __init__(self, start_az, start_el, aim_az, aim_el, target_dist_km, hit_will_occur=False):
+    def __init__(
+        self, start_az, start_el, aim_az, aim_el, target_dist_km,
+        target_id=None, shot_vx=0.0, shot_vy=0.0, hit_will_occur=False, side="L"
+    ):
         self.start_az = start_az
         self.start_el = start_el
         self.aim_az = aim_az
         self.aim_el = aim_el
-        self.target_dist_km = max(0.2, target_dist_km)
-        self.travel_time_total = max(0.12, (self.target_dist_km * 1000.0) / GUN_MUZZLE_VEL_MS)
+        self.target_dist_km = max(0.1, target_dist_km)
+        self.travel_time_total = max(0.06, min(1.6, (self.target_dist_km * 1000.0) / (GUN_MUZZLE_VEL_MS + 350.0)))
         self.elapsed = 0.0
+        self.target_id = target_id
+        self.shot_vx = float(shot_vx)
+        self.shot_vy = float(shot_vy)
         self.hit_will_occur = hit_will_occur
+        self.side = side  # 'L' = нижний левый угол, 'R' = нижний правый угол
         self.active = True
 
 
@@ -717,12 +732,25 @@ class ThermalMonitorWidget(QWidget):
             if not tr.active:
                 continue
             prog = min(1.0, tr.elapsed / tr.travel_time_total)
-            cur_az = tr.start_az + ang_diff_deg(tr.aim_az, tr.start_az) * prog
-            cur_el = tr.start_el + (tr.aim_el - tr.start_el) * prog
-            pt = self._project_angles(cur_az, cur_el, eff_fov)
-            if pt is not None:
-                tx, ty = pt
-                fade_heat = max(0.46, 0.95 * (1.0 - 0.42 * prog))
+            # Точка старта в нижнем левом ('L') или нижнем правом ('R') углу экрана (на любом зуме x1/x2/x4)
+            sx_px = 4.0 if getattr(tr, "side", "L") == "L" else float(SENSOR_W - 5)
+            sy_px = float(SENSOR_H - 3)
+
+            aim_pt = self._project_angles(tr.aim_az, tr.aim_el, eff_fov)
+            if aim_pt is not None:
+                ax_px, ay_px = float(aim_pt[0]), float(aim_pt[1])
+            else:
+                d_az_t = ang_diff_deg(tr.aim_az, self.cam_az)
+                d_el_t = tr.aim_el - self.cam_el
+                ax_px = (0.5 + d_az_t / eff_fov) * (SENSOR_W - 1)
+                ay_px = (0.5 - d_el_t / (eff_fov * (SENSOR_H / SENSOR_W))) * (SENSOR_H - 1)
+
+            # Перспективное ускорение сближения: у дула трассер проходит нижний угол быстро, у цели замедляется
+            p_vis = 1.0 - ((1.0 - prog) ** 1.45)
+            tx = int(round(sx_px + (ax_px - sx_px) * p_vis))
+            ty = int(round(sy_px + (ay_px - sy_px) * p_vis))
+            if 0 <= tx < SENSOR_W and 0 <= ty < SENSOR_H:
+                fade_heat = max(0.50, 0.96 * (1.0 - 0.38 * prog))
                 sz_t = 2 if prog < 0.35 else 1
                 for dy in range(sz_t):
                     for dx in range(sz_t):
@@ -1202,7 +1230,8 @@ class TacticalRadarWidget(QWidget):
                 painter.setPen(QPen(col, 2, Qt.PenStyle.DashLine if (coasting or is_inter_sweep) else Qt.PenStyle.SolidLine))
                 painter.drawLine(QPointF(tx, ty), QPointF(vx_end, vy_end))
 
-                ch_badge = f" [{self.channel_assignments[t.id]['mode']}]" if t.id in self.channel_assignments else ""
+                ch_item = self.channel_assignments.get(t.id) if isinstance(self.channel_assignments, dict) else None
+                ch_badge = f" [{ch_item['mode']}]" if isinstance(ch_item, dict) and "mode" in ch_item else ""
 
                 if coasting:
                     painter.setPen(QPen(col, 2))
@@ -1321,27 +1350,28 @@ def detection_threshold(noise_level):
 def ascope_curve(noise_level, targets, n=420, rng=None):
     rng = rng or np.random.default_rng()
     thr = detection_threshold(noise_level)
-    sigma = thr / 4.2
+    sigma = 0.03 + (noise_level ** 1.15) * 0.85 + (0.14 if noise_level >= 0.70 else 0.0)
     x = np.linspace(0.0, MAX_RANGE_KM, n)
-    sig = 0.5 * thr * np.exp(-x / 2.5)
+    sig = 0.35 * thr * np.exp(-x / 2.5)
     for r_km, amp in targets:
         sig = sig + amp * np.exp(-0.5 * ((x - r_km) / 0.45) ** 2)
     n1 = rng.normal(0.0, sigma, n)
     n2 = rng.normal(0.0, sigma, n)
     y = np.sqrt((sig + n1) ** 2 + n2 ** 2)
-    ymax = max(thr * 1.8, min(float(sig.max()) * 1.1, thr * 6.0))
+    peak_sig = float(sig.max()) if len(targets) > 0 else 0.0
+    ymax = max(2.8, thr * 1.35, min(peak_sig * 1.15, 16.0))
     return x, y, thr, ymax
 
 
 def doppler_curve(noise_level, f0_ghz, fd_khz, amp, n=700, rng=None):
     rng = rng or np.random.default_rng()
     thr = detection_threshold(noise_level)
-    sigma = thr / 4.2
+    sigma = 0.03 + (noise_level ** 1.15) * 0.85 + (0.14 if noise_level >= 0.70 else 0.0)
     f0 = f0_ghz * 1e9
     fmax = 2.0 * 350.0 * f0 / C / 1000.0
     notch = 2.0 * NOTCH_VR_MS * f0 / C / 1000.0
     x = np.linspace(-fmax, fmax, n)
-    clutter = 2.2 * thr
+    clutter = 1.6 + 1.4 * thr
     sig = clutter * np.exp(-0.5 * (x / max(0.10, notch * 0.25)) ** 2)
     top = clutter
     if fd_khz is not None and amp is not None:
@@ -1351,7 +1381,7 @@ def doppler_curve(noise_level, f0_ghz, fd_khz, amp, n=700, rng=None):
     n1 = rng.normal(0.0, sigma, n)
     n2 = rng.normal(0.0, sigma, n)
     y = np.sqrt((sig + n1) ** 2 + n2 ** 2)
-    ymax = max(thr * 1.8, min(top * 1.1, thr * 5.0))
+    ymax = max(3.2, thr * 1.35, min(top * 1.15, 16.0))
     return x, y, thr, ymax, notch
 
 
@@ -1619,6 +1649,8 @@ class PantsirCombatWorkstation(QMainWindow):
         self.active_tracers = []
 
         self.channel_assignments = {}
+        self.channel_auto_mode = True
+        self.manual_channel_type = "РК"
         self.latest_threat_target_id = None
 
         self.targets = []
@@ -1679,7 +1711,7 @@ class PantsirCombatWorkstation(QMainWindow):
             # Появляются дальше (27–40 км) под разными углами
             ang = ((idx * (360.0 / max(1, len(chosen)))) + random.uniform(-18.0, 18.0)) % 360.0
             rad_az = math.radians(ang)
-            spawn_dist = random.uniform(27.0, 39.0)
+            spawn_dist = random.uniform(27.0, 40.0)
             x = spawn_dist * math.sin(rad_az)
             y = spawn_dist * math.cos(rad_az)
             alt = random.uniform(1.6, 8.2) if kind == "fighter" else random.uniform(1.0, 3.2)
@@ -1760,6 +1792,7 @@ class PantsirCombatWorkstation(QMainWindow):
         root.addWidget(top_bar)
 
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._on_tab_changed_safe)
         root.addWidget(self.tabs, stretch=1)
 
         self.tab_oes = QWidget()
@@ -1829,24 +1862,43 @@ class PantsirCombatWorkstation(QMainWindow):
         cb_title.setStyleSheet("background-color: #b0bec5; padding: 2px 4px; font-weight: bold;")
         cb_l.addWidget(cb_title)
 
-        sel_w_row = QHBoxLayout()
-        self.btn_sel_gun = QPushButton("ТИП: 2А38М (30мм)")
-        self.btn_sel_gun.setCheckable(True)
-        self.btn_sel_gun.setChecked(True)
-        self.btn_sel_gun.clicked.connect(lambda: self._select_weapon_type("GUN"))
-        sel_w_row.addWidget(self.btn_sel_gun)
+        ch_mode_row = QHBoxLayout()
+        ch_mode_row.setSpacing(3)
+        self.btn_chan_auto = QPushButton("КАНАЛЫ: АВТО")
+        self.btn_chan_auto.setCheckable(True)
+        self.btn_chan_auto.setChecked(True)
+        self.btn_chan_auto.setFixedHeight(22)
+        self.btn_chan_auto.clicked.connect(self._toggle_channel_auto_mode)
+        ch_mode_row.addWidget(self.btn_chan_auto, stretch=2)
 
-        self.btn_sel_sam = QPushButton("ТИП: ЗУР 95Я6")
-        self.btn_sel_sam.setCheckable(True)
-        self.btn_sel_sam.clicked.connect(lambda: self._select_weapon_type("SAM"))
-        sel_w_row.addWidget(self.btn_sel_sam)
-        cb_l.addLayout(sel_w_row)
+        self.btn_ch_rk = QPushButton("РК")
+        self.btn_ch_rk.setCheckable(True)
+        self.btn_ch_rk.setChecked(True)
+        self.btn_ch_rk.setEnabled(False)
+        self.btn_ch_rk.setFixedHeight(22)
+        self.btn_ch_rk.clicked.connect(lambda: self._select_manual_channel("РК"))
+        ch_mode_row.addWidget(self.btn_ch_rk, stretch=1)
+
+        self.btn_ch_saclos = QPushButton("SACLOS")
+        self.btn_ch_saclos.setCheckable(True)
+        self.btn_ch_saclos.setEnabled(False)
+        self.btn_ch_saclos.setFixedHeight(22)
+        self.btn_ch_saclos.clicked.connect(lambda: self._select_manual_channel("SACLOS"))
+        ch_mode_row.addWidget(self.btn_ch_saclos, stretch=1)
+
+        self.btn_ch_oes = QPushButton("ОЭС")
+        self.btn_ch_oes.setCheckable(True)
+        self.btn_ch_oes.setEnabled(False)
+        self.btn_ch_oes.setFixedHeight(22)
+        self.btn_ch_oes.clicked.connect(lambda: self._select_manual_channel("ОЭС"))
+        ch_mode_row.addWidget(self.btn_ch_oes, stretch=1)
+        cb_l.addLayout(ch_mode_row)
 
         fire_row = QHBoxLayout()
         self.btn_fire_gun = QPushButton("ОГОНЬ 2А38М\n(УДЕРЖ. ЛКМ)")
-        self.btn_fire_gun.setMinimumHeight(42)
+        self.btn_fire_gun.setMinimumHeight(54)
         self.btn_fire_gun.setStyleSheet(
-            "QPushButton { background-color: #ffe082; color: #111; border: 2px solid #ef6c00; font-weight: bold; }"
+            "QPushButton { background-color: #ffe082; color: #111; border: 2px solid #ef6c00; font-weight: bold; font-size: 12px; }"
             "QPushButton:pressed { background-color: #ff6d00; color: #fff; }"
             "QPushButton:disabled { background-color: #90a4ae; color: #37474f; border: 1px solid #546e7a; }"
         )
@@ -1855,9 +1907,9 @@ class PantsirCombatWorkstation(QMainWindow):
         fire_row.addWidget(self.btn_fire_gun)
 
         self.btn_launch_sam = QPushButton("ПУСК ЗУР 95Я6\n(ОДИНОЧНЫЙ)")
-        self.btn_launch_sam.setMinimumHeight(42)
+        self.btn_launch_sam.setMinimumHeight(54)
         self.btn_launch_sam.setStyleSheet(
-            "QPushButton { background-color: #ffcdd2; color: #111; border: 2px solid #c62828; font-weight: bold; }"
+            "QPushButton { background-color: #ffcdd2; color: #111; border: 2px solid #c62828; font-weight: bold; font-size: 12px; }"
             "QPushButton:pressed { background-color: #d50000; color: #fff; }"
             "QPushButton:disabled { background-color: #90a4ae; color: #37474f; border: 1px solid #546e7a; }"
         )
@@ -2241,8 +2293,6 @@ class PantsirCombatWorkstation(QMainWindow):
 
     def _select_weapon_type(self, wtype):
         self.selected_weapon = wtype
-        self.btn_sel_gun.setChecked(wtype == "GUN")
-        self.btn_sel_sam.setChecked(wtype == "SAM")
 
     def _get_selected_target(self):
         idx = self.combo_radar_target.currentIndex()
@@ -2264,10 +2314,48 @@ class PantsirCombatWorkstation(QMainWindow):
         dir_cnt = sum(1 for v in self.channel_assignments.values() if v["directed"])
         return rk_cnt, saclos_cnt, oes_cnt, dir_cnt
 
+    def _toggle_channel_auto_mode(self):
+        self.channel_auto_mode = bool(self.btn_chan_auto.isChecked())
+        self.btn_chan_auto.setText("КАНАЛЫ: АВТО" if self.channel_auto_mode else "КАНАЛЫ: РУЧН.")
+        manual_enabled = not self.channel_auto_mode
+        for btn in (self.btn_ch_rk, self.btn_ch_saclos, self.btn_ch_oes):
+            btn.setEnabled(manual_enabled)
+        if manual_enabled:
+            self._select_manual_channel(self.manual_channel_type)
+            self._log_event(f"Включён ручной выбор каналов наведения ЗУР (активен: {self.manual_channel_type})", "INFO")
+        else:
+            self._log_event("Включён автоматический выбор каналов наведения ЗУР (РК -> SACLOS -> ОЭС)", "INFO")
+
+    def _select_manual_channel(self, ch_type):
+        self.manual_channel_type = ch_type
+        self.btn_ch_rk.setChecked(ch_type == "РК")
+        self.btn_ch_saclos.setChecked(ch_type == "SACLOS")
+        self.btn_ch_oes.setChecked(ch_type == "ОЭС")
+
     def _assign_guidance_channel(self, target_id):
         if target_id in self.channel_assignments:
             return self.channel_assignments[target_id]
         rk_cnt, saclos_cnt, oes_cnt, dir_cnt = self._get_channel_counts()
+
+        if not getattr(self, "channel_auto_mode", True):
+            chosen = getattr(self, "manual_channel_type", "РК")
+            if chosen == "РК":
+                if rk_cnt >= 3:
+                    return None
+                info = {"mode": "РК", "directed": False}
+            elif chosen == "SACLOS":
+                if saclos_cnt >= 1 or dir_cnt >= 2:
+                    return None
+                info = {"mode": "SACLOS", "directed": True}
+            elif chosen == "ОЭС":
+                if oes_cnt >= 1 or dir_cnt >= 2:
+                    return None
+                info = {"mode": "ОЭС", "directed": True}
+            else:
+                return None
+            self.channel_assignments[target_id] = info
+            return info
+
         if rk_cnt < 3:
             info = {"mode": "РК", "directed": False}
         elif saclos_cnt < 1 and dir_cnt < 2:
@@ -2309,36 +2397,52 @@ class PantsirCombatWorkstation(QMainWindow):
 
         ch = self._assign_guidance_channel(t.id)
         if ch is None:
-            self._log_event("ВСЕ 5 КАНАЛОВ НАВЕДЕНИЯ ЗАНЯТЫ (3 РК + 1 SACLOS + 1 ОЭС, 2 НАПРАВЛЕННЫХ)!", "WARN")
+            if not getattr(self, "channel_auto_mode", True):
+                self._log_event(
+                    f"ВЫБРАННЫЙ ВРУЧНУЮ КАНАЛ [{self.manual_channel_type}] ЗАНЯТ ИЛИ НЕДОСТУПЕН! ПЕРЕКЛЮЧИТЕ КАНАЛ ИЛИ ВКЛЮЧИТЕ АВТО",
+                    "WARN"
+                )
+            else:
+                self._log_event("ВСЕ 5 КАНАЛОВ НАВЕДЕНИЯ ЗАНЯТЫ (3 РК + 1 SACLOS + 1 ОЭС, 2 НАПРАВЛЕННЫХ)!", "WARN")
             return
 
-        self.sam_ammo -= 1
-        self.sam_cooldown = SAM_FIRE_INTERVAL
-        sam = ActiveSamProjectile(self.next_sam_id, t.id, ch["mode"], ch["directed"], az, el)
-        self.next_sam_id += 1
-        self.active_sams.append(sam)
-        self.sound_engine.play_sam_launch()
+        try:
+            self.sam_ammo -= 1
+            self.sam_cooldown = SAM_FIRE_INTERVAL
+            sam = ActiveSamProjectile(self.next_sam_id, t.id, ch["mode"], ch["directed"], az, el)
+            self.next_sam_id += 1
+            self.active_sams.append(sam)
+            self.sound_engine.play_sam_launch()
 
-        dir_tag = " [НАПРАВЛЕННЫЙ]" if ch["directed"] else ""
-        self._log_event(
-            f"ПУСК ЗУР 95Я6 #{sam.id} ПО Ц{t.id} ({t.name}) | КАНАЛ: {ch['mode']}{dir_tag} | ОСТАТОК ЗУР: {self.sam_ammo}",
-            "INFO"
-        )
+            dir_tag = " [НАПРАВЛЕННЫЙ]" if ch.get("directed") else ""
+            self._log_event(
+                f"ПУСК ЗУР 95Я6 #{sam.id} ПО Ц{t.id} ({t.name}) | КАНАЛ: {ch.get('mode', 'РК')}{dir_tag} | ОСТАТОК ЗУР: {self.sam_ammo}",
+                "INFO"
+            )
+        except Exception as exc:
+            _log_py_err("_on_sam_launch_clicked", exc)
         if t.under_fire_react_cd <= 0.0:
-            t.trigger_defensive_maneuver(force_notch=(random.random() < 0.35))
-            t.under_fire_react_cd = 4.0
-            self._log_event(f"Ц{t.id}: зафиксирован уход в контрманёвр!", "WARN")
+            if t.kind == "uav":
+                # У БПЛА нет СПО — они крайне редко замечают пуск и реагируют на него
+                t.under_fire_react_cd = 7.5
+                if random.random() < 0.12:
+                    t.trigger_defensive_maneuver(force_notch=False)
+                    self._log_event(f"Ц{t.id} (БПЛА, без СПО): вялый уход после визуального замечения пуска", "INFO")
+            else:
+                t.trigger_defensive_maneuver(force_notch=(random.random() < 0.35))
+                t.under_fire_react_cd = 4.0
+                self._log_event(f"Ц{t.id}: зафиксирован уход в контрманёвр!", "WARN")
 
-    def _compute_gun_lead_angles(self, target):
+    def _compute_gun_lead_angles(self, target, scatter_deg=0.0):
         r_km, _, _ = target.polar()
         tof = (r_km * 1000.0) / GUN_MUZZLE_VEL_MS
         pred_x = target.x + (target.vx / 1000.0) * tof
         pred_y = target.y + (target.vy / 1000.0) * tof
         pred_alt = target.alt
         r_h = math.hypot(pred_x, pred_y)
-        aim_az = math.degrees(math.atan2(pred_x, pred_y)) % 360.0
+        aim_az = (math.degrees(math.atan2(pred_x, pred_y)) + random.uniform(-scatter_deg, scatter_deg)) % 360.0
         drop_km = 0.5 * 9.81 * (tof ** 2) / 1000.0
-        aim_el = math.degrees(math.atan2(pred_alt + drop_km, max(0.05, r_h)))
+        aim_el = math.degrees(math.atan2(pred_alt + drop_km, max(0.05, r_h))) + random.uniform(-scatter_deg * 0.75, scatter_deg * 0.75)
         return aim_az, aim_el, tof
 
     def _process_gun_firing_step(self, dt_real):
@@ -2400,17 +2504,46 @@ class PantsirCombatWorkstation(QMainWindow):
 
         if shots_this_tick > 0:
             self.sound_engine.play_gun_shot(self.sim_time_sec)
-            aim_az, aim_el, _ = self._compute_gun_lead_angles(t)
-            start_az = (self.cam_az + random.uniform(-0.8, 0.8)) % 360.0
-            start_el = max(0.0, self.cam_el - 3.2 + random.uniform(-0.4, 0.4))
-            hit_prob = max(0.18, min(0.88, 1.0 - (r_km / 6.2) * 0.65))
+            # Первые 2 ленты (702 выстрела) летят из левого нижнего угла ('L'), остальные 2 ленты — из правого ('R')
+            shots_spent = max(0, GUN_MAX_AMMO - self.gun_ammo - 1)
+            belt_idx = shots_spent // GUN_BELT_SIZE
+            tracer_side = "L" if belt_idx < 2 else "R"
+
+            heat_factor = max(0.0, (self.gun_temp - TEMP_AMBIENT) / (TEMP_CRIT - TEMP_AMBIENT))
+            scatter_deg = 0.42 + max(0.0, r_km) * 0.14 + heat_factor * 0.65
+            aim_az, aim_el, _ = self._compute_gun_lead_angles(t, scatter_deg=scatter_deg)
+            start_az = (self.cam_az + (-4.5 if tracer_side == "L" else 4.5)) % 360.0
+            start_el = max(0.0, self.cam_el - 6.0)
+
+            max_gun_kill_km = 7.0
+            if r_km > max_gun_kill_km:
+                hit_prob = 0.0
+            else:
+                closeness = max(0.0, min(1.0, (max_gun_kill_km - r_km) / max_gun_kill_km))
+                if t.is_munitions:
+                    # Подлетающий боеприпас идёт встречным курсом — его легче перехватить очередью на подлёте
+                    base_p = 0.12 + 0.80 * (closeness ** 1.35)
+                else:
+                    base_p = 0.025 + 0.825 * (closeness ** 1.65)
+                scatter_penalty = max(0.35, 1.0 - heat_factor * 0.35)
+                hit_prob = max(0.0, min(0.92, base_p * scatter_penalty))
+
             will_hit = (random.random() < hit_prob)
             self.active_tracers.append(
-                GunTracerBurst(start_az, start_el, aim_az, aim_el, r_km, hit_will_occur=will_hit)
+                GunTracerBurst(
+                    start_az, start_el, aim_az, aim_el, r_km,
+                    target_id=t.id, shot_vx=t.vx, shot_vy=t.vy, hit_will_occur=will_hit,
+                    side=tracer_side
+                )
             )
             if t.under_fire_react_cd <= 0.0:
-                t.trigger_defensive_maneuver(force_notch=False)
-                t.under_fire_react_cd = 3.5
+                if t.kind == "uav":
+                    t.under_fire_react_cd = 6.5
+                    if random.random() < 0.14:
+                        t.trigger_defensive_maneuver(force_notch=False)
+                else:
+                    t.trigger_defensive_maneuver(force_notch=False)
+                    t.under_fire_react_cd = 3.5
 
     def _spawn_enemy_ordnance(self, attacker):
         if not attacker.ordnance:
@@ -2467,6 +2600,8 @@ class PantsirCombatWorkstation(QMainWindow):
 
     def _on_extra_noise_change(self, val):
         self.slider_r_noise.setValue(val)
+        if hasattr(self, "tabs") and self.tabs.currentWidget() is self.tab_extra:
+            self._update_extra_tab()
 
     def _update_extra_tab(self):
         powered = bool(getattr(self, "suo_powered", False))
@@ -2602,11 +2737,11 @@ class PantsirCombatWorkstation(QMainWindow):
         <hr style="border: 1px solid #455a64;">
         <h3 style="color:#69f0ae;">5. Боевой режим: вооружение, каналы наведения и противники</h3>
         <ul>
-          <li><b>Запуск и настройка:</b> активируется во вкладке <b>«Сценарии» → «6. БОЕВОЙ РЕЖИМ»</b>. Перед запуском можно настроить число противников (1–10) и их состав (Су-30СМ, F-16C, Rafale, БПЛА).</li>
+          <li><b>Запуск и настройка:</b> активируется во вкладке <b>«Сценарии» → «8. БОЕВОЙ РЕЖИМ»</b>. Перед запуском можно настроить число противников (1–10) и их состав (Су-30СМ, F-16C, Rafale, БПЛА).</li>
           <li><b>Дальний спавн и выход за пределы РЛС:</b> в боевом режиме цели появляются на дальности 27–39 км и могут залетать за пределы радара (36 км) ещё на ±4 км (до 40 км), временно выходя из зоны обнаружения РЛС.</li>
-          <li><b>Каналы сопровождения и наведения (всего 5):</b> <b>3 канала РК</b>, <b>1 канал SACLOS</b> и <b>1 канал ОЭС</b>, из них <b>2 канала направленные</b> (SACLOS и ОЭС). При выходе цели из поля зрения ОЭС или срыве по доплеру в SACLOS наведение по направленному каналу срывается.</li>
+          <li><b>Каналы сопровождения и наведения (всего 5):</b> <b>3 канала РК</b>, <b>1 канал SACLOS</b> и <b>1 канал ОЭС</b>, из них <b>2 канала направленные</b> (SACLOS и ОЭС). В боевом пульте доступен переключатель <b>КАНАЛЫ: АВТО / РУЧН.</b> — в ручном режиме оператор сам выбирает тип канала (<b>РК</b>, <b>SACLOS</b> или <b>ОЭС</b>) перед пуском ЗУР. При выходе цели из поля зрения ОЭС или срыве по доплеру в SACLOS наведение по направленному каналу срывается.</li>
           <li><b>ЗУР 95Я6:</b> боезапас 12 ракет, темп пуска 30 пусков/мин (интервал 2 с), дальность до 20 км, макс. скорость 1300 м/с, время управляемого полёта 30 с.</li>
-          <li><b>Автопушки 2А38М:</b> боезапас 1404 снаряда (лента 351 снаряд), скорострельность 1250 выстр./мин, скорость снарядов ~960 м/с с автоматическим расчётом упреждения и баллистики. По умолчанию огонь заблокирован на дистанции &gt; 5 км (отключается во вкладке «Дополнительно»).</li>
+          <li><b>Автопушки 2А38М:</b> боезапас 1404 снаряда (лента 351 снаряд), скорострельность 1250 выстр./мин, скорость снарядов ~960 м/с с автоматическим расчётом упреждения и баллистики, угловым разбросом и максимальной дистанцией поражения до 7 км. По умолчанию огонь заблокирован на дистанции &gt; 5 км (отключается во вкладке «Дополнительно»).</li>
         </ul>
 
         <h3 style="color:#ffd54f;">6. Нагрев, остывание и клин автопушек</h3>
@@ -2844,10 +2979,12 @@ class PantsirCombatWorkstation(QMainWindow):
         left_box = QFrame()
         left_box.setObjectName("PanelBlock")
         ll = QVBoxLayout(left_box)
-        ll.setSpacing(6)
+        ll.setSpacing(5)
 
         hdr = QLabel("ВЫБОР ТАКТИЧЕСКОГО СЦЕНАРИЯ ОБСТАНОВКИ")
-        hdr.setStyleSheet("background-color: #b0bec5; padding: 6px; font-weight: bold; font-size: 12.5px;")
+        hdr.setFixedHeight(32)
+        hdr.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hdr.setStyleSheet("background-color: #b0bec5; padding: 4px 8px; font-weight: bold; font-size: 12.5px;")
         ll.addWidget(hdr)
 
         scenarios_info = [
@@ -2856,18 +2993,22 @@ class PantsirCombatWorkstation(QMainWindow):
             ("beam_evasion", "3. ТРАВЕРЗНЫЙ ПРОХОД (СРЫВ ДОПЛЕРА)", "Истребитель выходит на курс с Vr ≈ 0 в полосе режекции."),
             ("heavy_jam", "4. ПЛОТНЫЕ АКТИВНЫЕ ПОМЕХИ (78%)", "Высокий уровень помех (78%) с периодическими потерями отметок."),
             ("raid_group", "5. ГРУППОВОЙ НАЛЁТ (5 ЦЕЛЕЙ)", "Пять воздушных целей заходят в зоне 180°."),
-            ("combat_intercept", "6. БОЕВОЙ РЕЖИМ (ЗАПУСК ПО СОСТАВУ СНИЗУ)", "Старт боевого режима с настроенным числом и составом противников, спавном вдали и залётом за радар на +4 км."),
+            ("high_altitude_dash", "6. ВЫСОТНЫЙ ПРОХОД (УЧЕБНЫЙ)", "Высотные цели (9–11 км) на большой скорости для проверки угла места и сопровождения ОЭС."),
+            ("close_gun_drill", "7. БЛИЖНИЙ БОЙ НА ДИСТАНЦИИ ДО 7 КМ (УЧЕБНЫЙ)", "Цели подходят на малую дистанцию (до 7 км) для отработки упреждения и разброса 2А38М."),
+            ("combat_intercept", "8. БОЕВОЙ РЕЖИМ (ЗАПУСК ПО СОСТАВУ СНИЗУ)", "Старт боевого режима с настроенным числом и составом противников, спавном вдали и залётом за радар на +4 км."),
         ]
 
-        for sc_key, btn_title, desc in scenarios_info:
+        grid_cards = QGridLayout()
+        grid_cards.setSpacing(5)
+        for idx_sc, (sc_key, btn_title, desc) in enumerate(scenarios_info):
             card = QFrame()
             card.setStyleSheet("background-color: #eceff1; border: 1px solid #90a4ae; border-radius: 3px;")
             cl = QVBoxLayout(card)
-            cl.setContentsMargins(8, 4, 8, 4)
+            cl.setContentsMargins(7, 4, 7, 4)
             cl.setSpacing(2)
 
             btn = QPushButton(btn_title)
-            btn.setMinimumHeight(26)
+            btn.setMinimumHeight(24)
             if sc_key == "combat_intercept":
                 btn.setStyleSheet("background-color: #ffcdd2; border: 2px solid #c62828; color: #b71c1c; font-weight: bold;")
             elif sc_key == "standard":
@@ -2877,29 +3018,34 @@ class PantsirCombatWorkstation(QMainWindow):
 
             lbl_d = QLabel(desc)
             lbl_d.setWordWrap(True)
-            lbl_d.setStyleSheet("color: #263238; font-size: 10px;")
+            lbl_d.setStyleSheet("color: #263238; font-size: 9.5px;")
             cl.addWidget(lbl_d)
-            ll.addWidget(card)
 
-        # Настройка количества и состава противников для боевого режима
+            r_pos = idx_sc // 2
+            c_pos = idx_sc % 2
+            grid_cards.addWidget(card, r_pos, c_pos)
+
+        ll.addLayout(grid_cards)
+
         cfg_card = QFrame()
+        cfg_card.setMaximumHeight(165)
         cfg_card.setStyleSheet("background-color: #fff8e1; border: 2px solid #f9a825; border-radius: 3px;")
         cfl = QVBoxLayout(cfg_card)
-        cfl.setContentsMargins(8, 6, 8, 6)
-        cfl.setSpacing(4)
+        cfl.setContentsMargins(8, 5, 8, 5)
+        cfl.setSpacing(3)
 
-        lbl_cfg_title = QLabel("НАСТРОЙКА ПРОТИВНИКОВ ДЛЯ БОЕВОГО РЕЖИМА:")
+        top_cfg_row = QHBoxLayout()
+        lbl_cfg_title = QLabel("НАСТРОЙКА ПРОТИВНИКОВ (БОЕВОЙ РЕЖИМ):")
         lbl_cfg_title.setStyleSheet("font-weight: bold; color: #e65100;")
-        cfl.addWidget(lbl_cfg_title)
-
-        cnt_row = QHBoxLayout()
-        cnt_row.addWidget(QLabel("Количество противников:"))
+        top_cfg_row.addWidget(lbl_cfg_title)
+        top_cfg_row.addStretch(1)
+        top_cfg_row.addWidget(QLabel("Кол-во:"))
         self.spin_enemy_count = QSpinBox()
         self.spin_enemy_count.setRange(1, 10)
         self.spin_enemy_count.setValue(4)
-        cnt_row.addWidget(self.spin_enemy_count)
-        cnt_row.addStretch(1)
-        cfl.addLayout(cnt_row)
+        self.spin_enemy_count.setFixedWidth(56)
+        top_cfg_row.addWidget(self.spin_enemy_count)
+        cfl.addLayout(top_cfg_row)
 
         add_row = QHBoxLayout()
         self.combo_enemy_template = QComboBox()
@@ -2917,12 +3063,13 @@ class PantsirCombatWorkstation(QMainWindow):
         cfl.addLayout(add_row)
 
         self.list_enemy_roster = QListWidget()
-        self.list_enemy_roster.setMaximumHeight(78)
+        self.list_enemy_roster.setMaximumHeight(64)
         for name_it in self.custom_combat_roster:
             self.list_enemy_roster.addItem(QListWidgetItem(name_it))
         cfl.addWidget(self.list_enemy_roster)
 
         ll.addWidget(cfg_card)
+        ll.addStretch(1)
         layout.addWidget(left_box, stretch=3)
 
         right_box = QFrame()
@@ -2994,6 +3141,38 @@ class PantsirCombatWorkstation(QMainWindow):
             out_mark = " [ЗА РАДАРОМ >36КМ]" if r_s > MAX_RANGE_KM else ""
             lines_info.append(f"• Ц{t.id} {t.name}: Д={r_s:.1f} км{out_mark}, АЗМ={az_s:.0f}°{ord_txt}")
         self.lbl_scenario_status.setText("<br>".join(lines_info))
+
+    def _sync_combos_with_targets(self):
+        cur_t = self._get_selected_target()
+        cur_id = cur_t.id if cur_t is not None else None
+
+        # Удаляем из списка сбитые вражеские боеприпасы (или долетевшие/уничтоженные)
+        self.targets = [t for t in self.targets if not (t.is_munitions and not t.alive)]
+
+        self.combo_oes_target.blockSignals(True)
+        self.combo_radar_target.blockSignals(True)
+        self.combo_oes_target.clear()
+        self.combo_radar_target.clear()
+
+        new_idx = 0
+        for i, t in enumerate(self.targets):
+            label = f"Ц{t.id} — {t.name}" if t.alive else f"Ц{t.id} — {t.name} [СБИТ]"
+            self.combo_oes_target.addItem(label)
+            self.combo_radar_target.addItem(label)
+            if not t.alive:
+                for cb in (self.combo_oes_target, self.combo_radar_target):
+                    fnt = cb.font()
+                    fnt.setStrikeOut(True)
+                    cb.setItemData(i, fnt, Qt.ItemDataRole.FontRole)
+                    cb.setItemData(i, QColor("#9e9e9e"), Qt.ItemDataRole.ForegroundRole)
+            if cur_id is not None and t.id == cur_id:
+                new_idx = i
+
+        if self.targets:
+            self.combo_oes_target.setCurrentIndex(new_idx)
+            self.combo_radar_target.setCurrentIndex(new_idx)
+        self.combo_oes_target.blockSignals(False)
+        self.combo_radar_target.blockSignals(False)
 
     def _rebuild_target_combos(self):
         self.combo_oes_target.blockSignals(True)
@@ -3085,6 +3264,26 @@ class PantsirCombatWorkstation(QMainWindow):
             self.btn_arc180_mode.setChecked(True)
             self.btn_arc180_mode.setText("ЗОНА 180° (ДОПЛЕР/ОБЗОР): ВКЛ")
 
+        elif key == "high_altitude_dash":
+            self.active_scenario_name = "Высотный проход (учебный)"
+            self.targets = [
+                SimTarget(1, "Су-30СМ (Высотный)", "fighter", 15.0, 20.0, 9.8, -165.0, -145.0, rcs=5.0),
+                SimTarget(2, "Rafale (Высотный)", "fighter", -17.0, 18.0, 10.6, 155.0, -135.0, rcs=3.6),
+                SimTarget(3, "БПЛА-разведчик", "uav", 9.0, 14.0, 4.5, -35.0, -45.0, rcs=0.65),
+            ]
+            self.next_target_id = 4
+            self.slider_r_noise.setValue(18)
+
+        elif key == "close_gun_drill":
+            self.active_scenario_name = "Ближний бой на дистанции до 7 км (учебный)"
+            self.targets = [
+                SimTarget(1, "F-16C (Ближний проход)", "fighter", 3.6, 4.4, 1.7, -95.0, -110.0, rcs=3.3),
+                SimTarget(2, "БПЛА-ударный", "uav", -2.8, 3.8, 1.2, 42.0, -55.0, rcs=0.80),
+                SimTarget(3, "Су-30СМ (Контроль)", "fighter", 4.5, 5.2, 2.2, -105.0, -90.0, rcs=5.0),
+            ]
+            self.next_target_id = 4
+            self.slider_r_noise.setValue(15)
+
         elif key == "combat_intercept":
             self.active_scenario_name = "БОЕВОЙ РЕЖИМ (ОТВЕТНЫЙ ОГОНЬ И ПЕРЕХВАТ)"
             if hasattr(self, "list_enemy_roster") and self.list_enemy_roster.count() > 0:
@@ -3122,7 +3321,9 @@ class PantsirCombatWorkstation(QMainWindow):
         belt_rem = self.gun_ammo % GUN_BELT_SIZE
         if belt_rem == 0 and self.gun_ammo > 0:
             belt_rem = GUN_BELT_SIZE
-        self.lbl_ammo_status.setText(f"БК 2А38М: {self.gun_ammo} (лента {belt_rem}) | ЗУР 95Я6: {self.sam_ammo}")
+        shots_spent_hud = max(0, GUN_MAX_AMMO - self.gun_ammo)
+        side_hud = "ЛЕВ." if (shots_spent_hud // GUN_BELT_SIZE) < 2 else "ПРАВ."
+        self.lbl_ammo_status.setText(f"БК 2А38М: {self.gun_ammo} (лента {belt_rem}, {side_hud}) | ЗУР 95Я6: {self.sam_ammo}")
 
         self.bar_gun_temp.setValue(int(min(TEMP_CRIT, max(TEMP_AMBIENT, self.gun_temp))))
         if self.gun_jammed:
@@ -3166,6 +3367,12 @@ class PantsirCombatWorkstation(QMainWindow):
         )
         self.btn_launch_sam.setEnabled(can_sam)
 
+    def _on_tab_changed_safe(self, _idx):
+        try:
+            QTimer.singleShot(0, self._tick)
+        except Exception as exc:
+            _log_py_err("_on_tab_changed_safe", exc)
+
     def _tick(self):
         try:
             self._tick_inner()
@@ -3199,20 +3406,38 @@ class PantsirCombatWorkstation(QMainWindow):
             self.sim_time_sec += dt_real
         self.thermal_widget.tick_glitch(dt_real)
 
+        target_by_id_tr = {t.id: t for t in self.targets}
         for tr in self.active_tracers:
             if not tr.active:
                 continue
             tr.elapsed += dt_real
             if tr.elapsed >= tr.travel_time_total:
                 tr.active = False
-                if tr.hit_will_occur:
-                    t_sel = self._get_selected_target()
-                    if t_sel is not None and t_sel.alive:
-                        t_sel.hp -= 28.0
-                        if t_sel.hp <= 0.0:
-                            t_sel.kill_with_explosion()
-                            self._release_channel_if_unused(t_sel.id)
-                            self._log_event(f"ЦЕЛЬ Ц{t_sel.id} ({t_sel.name}) СБИТА ОГНЁМ АВТОПУШЕК 2А38М!", "INFO")
+                if tr.hit_will_occur and tr.target_id is not None:
+                    tgt_tr = target_by_id_tr.get(tr.target_id)
+                    if tgt_tr is not None and tgt_tr.alive:
+                        r_now_tr, _, _ = tgt_tr.polar()
+                        spd_now = max(1.0, tgt_tr.speed())
+                        spd_shot = max(1.0, math.hypot(tr.shot_vx, tr.shot_vy))
+                        dot_v = (tgt_tr.vx * tr.shot_vx + tgt_tr.vy * tr.shot_vy) / (spd_now * spd_shot)
+                        dot_v = max(-1.0, min(1.0, dot_v))
+                        course_delta_deg = math.degrees(math.acos(dot_v))
+                        if r_now_tr > 7.0:
+                            continue
+                        if not tgt_tr.is_munitions:
+                            if course_delta_deg > 22.0 or tgt_tr.evasion_timer > 0.35:
+                                continue
+                        dmg = 22.0 if tgt_tr.is_munitions else 28.0
+                        tgt_tr.hp -= dmg
+                        if tgt_tr.hp <= 0.0:
+                            tgt_tr.kill_with_explosion()
+                            self._release_channel_if_unused(tgt_tr.id)
+                            if tgt_tr.is_munitions:
+                                self._log_event(f"ПОДЛЕТАЮЩИЙ БОЕПРИПАС Ц{tgt_tr.id} ({tgt_tr.name}) ПЕРЕХВАЧЕН ОГНЁМ 2А38М!", "INFO")
+                                self._sync_combos_with_targets()
+                            else:
+                                self._log_event(f"ЦЕЛЬ Ц{tgt_tr.id} ({tgt_tr.name}) СБИТА ОГНЁМ АВТОПУШЕК 2А38М!", "INFO")
+                            self._sync_combos_with_targets()
         self.active_tracers = [tr for tr in self.active_tracers if tr.active]
 
         target_by_id = {t.id: t for t in self.targets}
@@ -3250,12 +3475,28 @@ class PantsirCombatWorkstation(QMainWindow):
             dy = tgt.y - sam.y
             dz = tgt.alt - sam.alt
             dist_km = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+            # На терминальном участке (< 2.5 км) истребитель со СПО предпринимает резкий противоракетный манёвр уклонения
+            if tgt.kind == "fighter" and dist_km < 2.5 and not getattr(sam, "terminal_evade_checked", False):
+                sam.terminal_evade_checked = True
+                tgt.trigger_defensive_maneuver(force_notch=True)
+                evade_chance = 0.42 if sam.channel_mode == "РК" else (0.34 if sam.channel_mode == "SACLOS" else 0.24)
+                if random.random() < evade_chance:
+                    sam.active = False
+                    self._release_channel_if_unused(sam.target_id)
+                    self._log_event(
+                        f"Ц{tgt.id} ({tgt.name}): ПРОТИВОРАКЕТНЫЙ МАНЁВР И РЭБ — ПРОМАХ ЗУР 95Я6 #{sam.id}!",
+                        "WARN"
+                    )
+                    continue
+
             step_km = (SAM_SPEED_MS / 1000.0) * dt_real * 2.2
             if dist_km <= max(0.28, step_km):
                 sam.active = False
                 tgt.kill_with_explosion()
                 self._release_channel_if_unused(sam.target_id)
                 self._log_event(f"ПРЯМОЕ ПОПАДАНИЕ ЗУР 95Я6 #{sam.id}! ЦЕЛЬ Ц{tgt.id} ({tgt.name}) УНИЧТОЖЕНА!", "INFO")
+                self._sync_combos_with_targets()
             else:
                 sam.x += (dx / dist_km) * step_km
                 sam.y += (dy / dist_km) * step_km
